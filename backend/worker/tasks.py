@@ -84,8 +84,10 @@ def execute_action(action_id, worker_id):
 
 @shared_task
 def snapshot_health():
-    logger.info("Executing snapshot_health placeholder")
+    from backend.app.health import run_snapshot_health
+    run_snapshot_health()
 
 @shared_task
 def evaluate_alerts():
-    logger.info("Executing evaluate_alerts placeholder")
+    from backend.app.alerts import run_evaluate_alerts
+    run_evaluate_alerts()

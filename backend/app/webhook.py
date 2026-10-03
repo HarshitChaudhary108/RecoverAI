@@ -71,6 +71,9 @@ async def razorpay_webhook(request: Request):
     # Process the event
     try:
         payment_id, result = events.handle_razorpay_event(event_id, payload)
+        if payment_id and result:
+            from backend.worker.tasks import classify_payment
+            classify_payment.delay(payment_id)
         processing_result = "success" if result else "ignored"
     except Exception as e:
         logger.exception(f"Error processing razorpay webhook event {event_id}")

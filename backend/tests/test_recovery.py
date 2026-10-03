@@ -1,5 +1,5 @@
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from backend.app.db import get_db_cursor
 from backend.app.events import handle_razorpay_event
 
@@ -31,7 +31,8 @@ def test_captured_cancels_own_actions(db_cursor):
         "event": "payment.captured",
         "payload": {"payment": {"entity": {"id": payment_id, "order_id": order_id}}}
     }
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT status FROM scheduled_actions WHERE action_id = 'act_1'")
     assert db_cursor.fetchone()[0] == 'cancelled'
@@ -61,7 +62,8 @@ def test_captured_cancels_earlier_failed_payments_actions(db_cursor):
         "event": "payment.captured",
         "payload": {"payment": {"entity": {"id": pay_a, "order_id": order_id}}}
     }
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT status FROM scheduled_actions WHERE action_id = 'act_b'")
     assert db_cursor.fetchone()[0] == 'cancelled'
@@ -71,7 +73,7 @@ def test_attribution_email_within_48h(db_cursor):
     pay_failed = "pay_fail"
     pay_cap = "pay_cap"
     order_id = "ord_123"
-    sent_at = datetime.now() - timedelta(hours=2)
+    sent_at = datetime.now(timezone.utc) - timedelta(hours=2)
 
     db_cursor.execute(
         "INSERT INTO payments (payment_id, order_id, amount, currency, status, classification_status, recovery_status) VALUES (%s, %s, 100, 'INR', 'failed', 'classified', 'open')",
@@ -95,7 +97,8 @@ def test_attribution_email_within_48h(db_cursor):
         "event": "payment.captured",
         "payload": {"payment": {"entity": {"id": pay_cap, "order_id": order_id}}}
     }
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT recovery_status FROM payments WHERE payment_id = %s", (pay_failed,))
     assert db_cursor.fetchone()[0] == 'recovered'
@@ -107,7 +110,7 @@ def test_attribution_email_after_48h(db_cursor):
     pay_failed = "pay_fail"
     pay_cap = "pay_cap"
     order_id = "ord_123"
-    sent_at = datetime.now() - timedelta(hours=50)
+    sent_at = datetime.now(timezone.utc) - timedelta(hours=50)
 
     db_cursor.execute(
         "INSERT INTO payments (payment_id, order_id, amount, currency, status, classification_status, recovery_status) VALUES (%s, %s, 100, 'INR', 'failed', 'classified', 'open')",
@@ -131,7 +134,8 @@ def test_attribution_email_after_48h(db_cursor):
         "event": "payment.captured",
         "payload": {"payment": {"entity": {"id": pay_cap, "order_id": order_id}}}
     }
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT recovery_status FROM payments WHERE payment_id = %s", (pay_failed,))
     assert db_cursor.fetchone()[0] == 'self_recovered'
@@ -156,7 +160,8 @@ def test_attribution_no_email(db_cursor):
         "event": "payment.captured",
         "payload": {"payment": {"entity": {"id": pay_cap, "order_id": order_id}}}
     }
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT recovery_status FROM payments WHERE payment_id = %s", (pay_failed,))
     assert db_cursor.fetchone()[0] == 'self_recovered'
@@ -193,7 +198,8 @@ def test_paid_link_recovery(db_cursor):
             "payment_link": {"entity": {"id": link_id}}
         }
     }
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT recovery_status FROM payments WHERE payment_id = %s", (pay_fail,))
     assert db_cursor.fetchone()[0] == 'recovered'
@@ -231,8 +237,9 @@ def test_idempotency_capture(db_cursor):
         "event": "payment.captured",
         "payload": {"payment": {"entity": {"id": pay_id, "order_id": order_id}}}
     }
-    handle_razorpay_event("evt_1", payload)
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT status FROM payments WHERE payment_id = %s", (pay_id,))
     assert db_cursor.fetchone()[0] == 'captured'
@@ -255,7 +262,8 @@ def test_holdout_captured_self_recovered(db_cursor):
         "event": "payment.captured",
         "payload": {"payment": {"entity": {"id": pay_id, "order_id": order_id}}}
     }
-    handle_razorpay_event("evt_1", payload)
+    handle_razorpay_event("evt_1", payload, cur=db_cursor)
+    db_cursor.connection.commit()
 
     db_cursor.execute("SELECT recovery_status FROM payments WHERE payment_id = %s", (pay_id,))
     assert db_cursor.fetchone()[0] == 'self_recovered'

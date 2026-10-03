@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: str
     RAZORPAY_WEBHOOK_SECRET: str
     DATABASE_URL: str
+    TEST_DATABASE_URL: str
     # No default REDIS_URL. Pydantic will raise a ValidationError if missing.
     REDIS_URL: str
     NGROK_AUTHTOKEN: str

@@ -37,7 +37,7 @@ def retry_stuck_classifications():
         cur.execute(
             "SELECT payment_id FROM payments "
             "WHERE (classification_status = 'pending' OR classification_status = 'failed') "
-            "AND attempts < %s "
+            "AND classification_attempts < %s "
             "AND updated_at < %s",
             (settings.MAX_CLASSIFICATION_RETRIES, datetime.utcnow() - timedelta(minutes=10))
         )

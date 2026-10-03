@@ -1,5 +1,8 @@
 import logging
 import time
+import uuid
+from datetime import datetime, timedelta
+from typing import Tuple, Optional
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 
@@ -7,6 +10,9 @@ from backend.app.classifier import classify_failure, ClassificationError
 from backend.app.policy import assign_group, get_policy, adjust_for_quiet_hours
 from backend.app.db import get_db_cursor
 from backend.app.config import settings
+
+def generate_action_id(payment_id, action_type, step):
+    return f"act_{payment_id}_{action_type}_{step}"
 
 logger = logging.getLogger(__name__)
 
@@ -48,29 +54,38 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
                 category = classification.category
                 confidence = classification.confidence
                 reason = classification.reason
-            except ClassificationError as e:
-                # Use a separate connection to ensure failure state is committed
-                # before the exception is re-raised and the main transaction rolls back.
-                with get_db_cursor() as fail_cur:
-                    fail_cur.execute(
-                        "UPDATE payments SET "
-                        "classification_status = 'failed', "
-                        "classification_error = %s, "
-                        "updated_at = %s "
-                        "WHERE payment_id = %s",
-                        (str(e), datetime.utcnow(), payment_id)
-                    )
-                    fail_cur.connection.commit()
-                raise e
+            except (ClassificationError, Exception) as e:
+                # Fix: Update failure state on the SAME cursor to avoid row-lock deadlock.
+                # This ensures the 'failed' status is persisted before the transaction
+                # is committed/rolled back.
+                error_detail = str(e) if isinstance(e, ClassificationError) else f"Unexpected error: {str(e)}"
+
+                cur.execute(
+                    "UPDATE payments SET "
+                    "classification_status = 'failed', "
+                    "classification_error = %s, "
+                    "classification_attempts = classification_attempts + 1, "
+                    "updated_at = %s "
+                    "WHERE payment_id = %s",
+                    (error_detail, datetime.utcnow(), payment_id)
+                )
+                # Commit the failure state immediately
+                cur.connection.commit()
+
+                # Re-raise as ClassificationError so Celery can handle retry logic
+                if isinstance(e, ClassificationError):
+                    raise e
+                raise ClassificationError(f"Unexpected classification failure: {str(e)}") from e
 
             # 3. Atomic Update: Save classification and schedule actions
             # Update payment status
             cur.execute(
                 "UPDATE payments SET "
-                "category = %s, "
-                "confidence = %s, "
+                "failure_category = %s, "
+                "classification_confidence = %s, "
                 "classification_reason = %s, "
                 "classification_status = 'classified', "
+                "classification_attempts = classification_attempts + 1, "
                 "updated_at = %s "
                 "WHERE payment_id = %s",
                 (category, confidence, reason, datetime.utcnow(), payment_id)
@@ -96,20 +111,21 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
 
                     cur.execute(
                         "INSERT INTO scheduled_actions "
-                        "(payment_id, action_type, step, run_at, status) "
-                        "VALUES (%s, %s, %s, %s, 'pending') "
+                        "(action_id, payment_id, action_type, step, run_at, status) "
+                        "VALUES (%s, %s, %s, %s, %s, 'pending') "
                         "ON CONFLICT (payment_id, action_type, step) DO NOTHING",
-                        (payment_id, step["action_type"], step["step"], run_at)
+                        (generate_action_id(payment_id, step["action_type"], step["step"]),
+                         payment_id, step["action_type"], step["step"], run_at)
                     )
 
             # Special case for 'other' category: manual review
             if category == "other":
                 cur.execute(
                     "INSERT INTO scheduled_actions "
-                    "(payment_id, action_type, step, run_at, status) "
-                    "VALUES (%s, 'manual_review', 1, %s, 'manual_review') "
+                    "(action_id, payment_id, action_type, step, run_at, status) "
+                    "VALUES (%s, %s, 'manual_review', 1, %s, 'manual_review') "
                     "ON CONFLICT (payment_id, action_type, step) DO NOTHING",
-                    (payment_id, datetime.utcnow())
+                    (generate_action_id(payment_id, 'manual_review', 1), payment_id, datetime.utcnow())
                 )
                 # Log raw error fields for manual review
                 logger.info(f"Manual review required for {payment_id}. Errors: {error_code}, {error_reason}, {error_source}, {error_step}")

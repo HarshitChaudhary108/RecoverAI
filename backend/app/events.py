@@ -1,9 +1,9 @@
 import logging
 import json
 from backend.app.db import get_db_cursor
-from backend.worker.tasks import classify_payment
 
 logger = logging.getLogger(__name__)
+
 
 def handle_razorpay_event(event_id: str, payload: dict, cur=None):
     """
@@ -65,8 +65,9 @@ def _process_event(event_id: str, payload: dict, cur):
             INSERT INTO payments (
                 payment_id, order_id, amount, currency, method, bank,
                 status, error_code, error_reason, error_source, error_step,
-                customer_email, customer_contact, classification_status, recovery_status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                customer_email, customer_contact, classification_status, recovery_status,
+                failed_at, payment_created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (payment_id) DO UPDATE SET
                 status = EXCLUDED.status,
                 error_code = EXCLUDED.error_code,
@@ -78,7 +79,8 @@ def _process_event(event_id: str, payload: dict, cur):
             """,
             (payment_id, order_id, amount, currency, method, bank,
              'failed', error_code, error_reason, error_source, error_step,
-             email, contact, 'pending', 'open')
+             email, contact, 'pending', 'open',
+             payload.get("created_at"), entity.get("created_at"))
         )
         success = True
 
@@ -88,7 +90,7 @@ def _process_event(event_id: str, payload: dict, cur):
         order_id = entity.get("order_id")
         if payment_id:
             cur.execute(
-                "UPDATE payments SET status = 'captured', updated_at = CURRENT_TIMESTAMP WHERE payment_id = %s AND status != 'captured'",
+                "UPDATE payments SET status = 'captured', captured_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE payment_id = %s AND status != 'captured'",
                 (payment_id,)
             )
 

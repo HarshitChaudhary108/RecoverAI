@@ -42,7 +42,7 @@ def test_classify_success_treatment(mock_db, mock_classifier):
     # 2. Update group
     # 3. Insert actions
     calls = mock_db.execute.call_args_list
-    assert any("UPDATE payments SET category = %s" in str(c) for c in calls)
+    assert any("UPDATE payments SET failure_category = %s" in str(c) for c in calls)
     assert any("UPDATE payments SET recovery_group = %s" in str(c) for c in calls)
     assert any("INSERT INTO scheduled_actions" in str(c) for c in calls)
 
@@ -136,7 +136,7 @@ def test_classify_error_updates_payment(mock_db, mock_classifier):
     # Verify failure update
     calls = [str(c) for c in mock_db.execute.call_args_list]
     assert any("classification_status = 'failed'" in s for s in calls)
-    assert any("attempts = attempts + 1" in s for s in calls)
+    assert any("classification_attempts = classification_attempts + 1" in s for s in calls)
 
 def test_retry_stuck_classifications(mock_db):
     from backend.worker.tasks import retry_stuck_classifications

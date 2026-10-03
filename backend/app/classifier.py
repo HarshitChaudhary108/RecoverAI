@@ -35,6 +35,9 @@ def classify_failure(
     """
     Classifies a payment failure using Groq LLM based on error details.
     """
+    # If any of the arguments are None, this might be a test case simulating failure
+    # or missing data. We still try to classify, but we don't want to crash.
+
     # 5. If all four fields are empty, return category "other" with reason "no error information"
     if not any([error_code, error_reason, error_source, error_step]):
         return FailureClassification(

@@ -67,20 +67,21 @@ def _process_event(event_id: str, payload: dict, cur):
                 status, error_code, error_reason, error_source, error_step,
                 customer_email, customer_contact, classification_status, recovery_status,
                 failed_at, payment_created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             ON CONFLICT (payment_id) DO UPDATE SET
                 status = EXCLUDED.status,
                 error_code = EXCLUDED.error_code,
                 error_reason = EXCLUDED.error_reason,
                 error_source = EXCLUDED.error_source,
                 error_step = EXCLUDED.error_step,
+                failed_at = NOW(),
                 updated_at = CURRENT_TIMESTAMP
             WHERE payments.status != 'captured'
             """,
             (payment_id, order_id, amount, currency, method, bank,
              'failed', error_code, error_reason, error_source, error_step,
              email, contact, 'pending', 'open',
-             payload.get("created_at"), entity.get("created_at"))
+             entity.get("created_at"))
         )
         success = True
 

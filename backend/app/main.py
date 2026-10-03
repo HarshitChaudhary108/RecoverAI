@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.app.logging_setup import setup_logging
 from backend.app.webhook import router as webhook_router
 from backend.app.api import api_router
+from backend.worker.celery_app import app as celery_app  # The API must load the configured Celery app so .delay() uses the Redis broker
 
 app = FastAPI(title="Payment Recovery Agent API")
 

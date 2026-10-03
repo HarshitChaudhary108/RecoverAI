@@ -4,6 +4,7 @@ import socket
 from datetime import datetime, timedelta
 from celery import shared_task
 from backend.app.classification_service import classify_and_schedule
+from backend.app.config import settings
 from backend.app.classifier import ClassificationError
 from backend.app.db import get_db_cursor
 from backend.app.config import settings
@@ -33,13 +34,13 @@ def retry_stuck_classifications():
     logger.info("Checking for stuck classifications...")
     with get_db_cursor() as cur:
         # Find payments that are pending or failed (and under max attempts)
-        # and haven't been updated in 10 minutes.
+        # and haven't been updated in the configured window.
         cur.execute(
             "SELECT payment_id FROM payments "
             "WHERE (classification_status = 'pending' OR classification_status = 'failed') "
             "AND classification_attempts < %s "
             "AND updated_at < %s",
-            (settings.MAX_CLASSIFICATION_RETRIES, datetime.utcnow() - timedelta(minutes=10))
+            (settings.MAX_CLASSIFICATION_RETRIES, datetime.utcnow() - timedelta(minutes=settings.STUCK_CLASSIFICATION_MINUTES))
         )
         stuck_payments = cur.fetchall()
 

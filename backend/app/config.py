@@ -19,7 +19,8 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: str
     RAZORPAY_WEBHOOK_SECRET: str
     DATABASE_URL: str
-    TEST_DATABASE_URL: str
+    TEST_DATABASE_URL: str = ""
+    # No default REDIS_URL. Pydantic will raise a ValidationError if missing.
     # No default REDIS_URL. Pydantic will raise a ValidationError if missing.
     REDIS_URL: str
     NGROK_AUTHTOKEN: str
@@ -78,5 +79,6 @@ class Settings(BaseSettings):
     TIMEOUT_RECHECK_DELAY_MINUTES: int = 10
     MAX_RECHECKS: int = 6
     MAX_CLASSIFICATION_RETRIES: int = 3
+    STUCK_CLASSIFICATION_MINUTES: int = 10
 
 settings = Settings()

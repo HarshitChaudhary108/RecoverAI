@@ -7,7 +7,7 @@ import os
 
 # Initialize the connection pool
 # The pool is created at module level to be reused across the application
-pool = ConnectionPool(conninfo=settings.DATABASE_URL)
+pool = ConnectionPool(conninfo=settings.DATABASE_URL, check=ConnectionPool.check_connection)
 
 @contextlib.contextmanager
 def get_db_cursor() -> Generator[psycopg.Cursor, None, None]:

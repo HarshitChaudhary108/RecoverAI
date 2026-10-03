@@ -69,7 +69,7 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
                     "WHERE payment_id = %s",
                     (error_detail, datetime.utcnow(), payment_id)
                 )
-                # Commit the failure state immediately
+                # Persist failure state immediately so it is not lost when the error is re-raised
                 cur.connection.commit()
 
                 # Re-raise as ClassificationError so Celery can handle retry logic

@@ -49,16 +49,18 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
                 confidence = classification.confidence
                 reason = classification.reason
             except ClassificationError as e:
-                # 4. Handle ClassificationError
-                cur.execute(
-                    "UPDATE payments SET "
-                    "classification_status = 'failed', "
-                    "classification_error = %s, "
-                    "attempts = attempts + 1, "
-                    "updated_at = %s "
-                    "WHERE payment_id = %s",
-                    (str(e), datetime.utcnow(), payment_id)
-                )
+                # Use a separate connection to ensure failure state is committed
+                # before the exception is re-raised and the main transaction rolls back.
+                with get_db_cursor() as fail_cur:
+                    fail_cur.execute(
+                        "UPDATE payments SET "
+                        "classification_status = 'failed', "
+                        "classification_error = %s, "
+                        "updated_at = %s "
+                        "WHERE payment_id = %s",
+                        (str(e), datetime.utcnow(), payment_id)
+                    )
+                    fail_cur.connection.commit()
                 raise e
 
             # 3. Atomic Update: Save classification and schedule actions

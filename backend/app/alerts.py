@@ -114,6 +114,8 @@ def run_evaluate_alerts():
                     updated_at = EXCLUDED.updated_at
             """, (scope, scope_value, new_state, new_streak, success_rate, baseline, attempts, datetime.utcnow()))
 
+            cur.connection.commit()
+
             if new_state != prev_state:
                 logger.info(f"ALERT STATE CHANGE: {scope}:{scope_value} {prev_state} -> {new_state} "
                             f"(rate: {success_rate}, baseline: {baseline}, attempts: {attempts})")

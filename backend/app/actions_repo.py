@@ -9,34 +9,14 @@ class ClaimError(Exception):
 class ActionsRepository:
     LEASE_TIME = timedelta(minutes=5)
 
-    def claim_due_actions(self, worker_id: str, limit: int) -> List[Dict[str, Any]]:
+    def claim_due_actions(self, worker_id: str, limit: int, cur=None) -> List[Dict[str, Any]]:
         """
-        Claims due actions in a single transaction.
+        Claims due actions in a single atomic transaction.
         An action is due if it's pending and run_at <= now,
         or if it was claimed but the lease has expired.
         """
-        with get_db_cursor() as cur:
-            # 1. Find and lock candidate rows
-            # We use a subquery to identify the IDs first to avoid locking more than we need
-            # and to handle the SKIP LOCKED correctly.
-            cur.execute(
-                """
-                SELECT action_id
-                FROM scheduled_actions
-                WHERE (status = 'pending' AND run_at <= NOW())
-                   OR (status = 'claimed' AND lease_expires_at < NOW())
-                ORDER BY run_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-                """,
-                (limit,)
-            )
-            ids = [row[0] for row in cur.fetchall()]
-
-            if not ids:
-                return []
-
-            # 2. Update the claimed rows
+        if cur is not None:
+            # Use provided cursor
             cur.execute(
                 """
                 UPDATE scheduled_actions
@@ -44,14 +24,46 @@ class ActionsRepository:
                     locked_by = %s,
                     lease_expires_at = NOW() + %s,
                     attempts = attempts + 1
-                WHERE action_id = ANY(%s)
+                WHERE action_id IN (
+                    SELECT action_id
+                    FROM scheduled_actions
+                    WHERE (status = 'pending' AND run_at <= NOW())
+                       OR (status = 'claimed' AND lease_expires_at < NOW())
+                    ORDER BY run_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
                 RETURNING action_id, payment_id, action_type, step, run_at, status, attempts, locked_by, lease_expires_at
                 """,
-                (worker_id, self.LEASE_TIME, ids)
+                (worker_id, self.LEASE_TIME, limit)
             )
-
             columns = [desc[0] for desc in cur.description]
             return [dict(zip(columns, row)) for row in cur.fetchall()]
+        else:
+            # Open a new transaction
+            with get_db_cursor() as internal_cur:
+                internal_cur.execute(
+                    """
+                    UPDATE scheduled_actions
+                    SET status = 'claimed',
+                        locked_by = %s,
+                        lease_expires_at = NOW() + %s,
+                        attempts = attempts + 1
+                    WHERE action_id IN (
+                        SELECT action_id
+                        FROM scheduled_actions
+                        WHERE (status = 'pending' AND run_at <= NOW())
+                           OR (status = 'claimed' AND lease_expires_at < NOW())
+                        ORDER BY run_at ASC
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING action_id, payment_id, action_type, step, run_at, status, attempts, locked_by, lease_expires_at
+                    """,
+                    (worker_id, self.LEASE_TIME, limit)
+                )
+                columns = [desc[0] for desc in internal_cur.description]
+                return [dict(zip(columns, row)) for row in internal_cur.fetchall()]
 
     def still_owns_claim(self, action_id: str, worker_id: str) -> bool:
         """True if action is claimed by worker_id and lease is still valid."""

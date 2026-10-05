@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Query
 
 from backend.app.db import get_db_cursor
 from backend.app.schemas import (
@@ -12,7 +12,6 @@ from backend.app.schemas import (
     SummaryStats,
     TimeSeriesPoint,
 )
-
 
 router = APIRouter()
 
@@ -25,16 +24,10 @@ class StatsService:
         return datetime.now(timezone.utc)
 
     def _get_start_time(self, hours: int) -> datetime:
-        if hours <= 0:
-            raise ValueError("hours must be positive")
         return self._utc_now() - timedelta(hours=hours)
 
     def get_summary(self, hours: int) -> SummaryStats:
-        """Return overall payment health and recovery KPIs.
-
-        Success rate is returned as a ratio in [0, 1] because the frontend's
-        formatPercent() converts that ratio to a display percentage.
-        """
+        """Return payment-health and recovery KPIs as frontend-compatible ratios."""
         now = self._utc_now()
         start_time = now - timedelta(hours=hours)
         risk_start = max(start_time, now - timedelta(days=7))
@@ -50,11 +43,13 @@ class StatsService:
                     ) AS failed_effective,
                     COUNT(*) FILTER (WHERE status = 'failed') AS failed_count,
                     COUNT(*) FILTER (
-                        WHERE recovery_status = 'recovered'
+                        WHERE status = 'failed'
+                          AND recovery_status = 'recovered'
                     ) AS recovered_count,
                     COALESCE(
                         SUM(amount) FILTER (
-                            WHERE recovery_status = 'recovered'
+                            WHERE status = 'failed'
+                              AND recovery_status = 'recovered'
                         ),
                         0
                     ) AS revenue_recovered,
@@ -75,39 +70,20 @@ class StatsService:
             )
             row = cur.fetchone()
 
-        if not row:
-            return SummaryStats(
-                success_rate=0.0,
-                failed_count=0,
-                recovered_count=0,
-                revenue_recovered=0,
-                revenue_at_risk=0,
-            )
-
-        (
-            captured,
-            failed_effective,
-            failed_count,
-            recovered_count,
-            revenue_recovered,
-            revenue_at_risk,
-        ) = row
-
-        denominator = int(captured or 0) + int(failed_effective or 0)
-        success_rate = (float(captured or 0) / denominator) if denominator else 0.0
+        captured = int(row[0] or 0) if row else 0
+        failed_effective = int(row[1] or 0) if row else 0
+        denominator = captured + failed_effective
 
         return SummaryStats(
-            success_rate=success_rate,
-            failed_count=int(failed_count or 0),
-            recovered_count=int(recovered_count or 0),
-            revenue_recovered=int(revenue_recovered or 0),
-            revenue_at_risk=int(revenue_at_risk or 0),
+            success_rate=(captured / denominator) if denominator else 0.0,
+            failed_count=int(row[2] or 0) if row else 0,
+            recovered_count=int(row[3] or 0) if row else 0,
+            revenue_recovered=int(row[4] or 0) if row else 0,
+            revenue_at_risk=int(row[5] or 0) if row else 0,
         )
 
     def get_timeseries(self, hours: int) -> List[TimeSeriesPoint]:
-        """Return global health snapshots as frontend-compatible points."""
         start_time = self._get_start_time(hours)
-
         with get_db_cursor() as cur:
             cur.execute(
                 """
@@ -125,14 +101,13 @@ class StatsService:
         return [
             TimeSeriesPoint(
                 timestamp=row[0],
-                success_rate=(float(row[1]) if row[1] is not None else None),
+                success_rate=float(row[1]) if row[1] is not None else None,
             )
             for row in rows
         ]
 
     def get_failure_reasons(self, hours: int) -> List[FailureReasonStat]:
         start_time = self._get_start_time(hours)
-
         with get_db_cursor() as cur:
             cur.execute(
                 """
@@ -155,15 +130,12 @@ class StatsService:
         ]
 
     def get_entity_stats(self, hours: int, dimension: str) -> List[EntityStat]:
-        """Return payment health grouped by bank or payment method."""
         if dimension not in {"bank", "method"}:
             raise ValueError("dimension must be bank or method")
 
         start_time = self._get_start_time(hours)
-        column = "bank" if dimension == "bank" else "method"
+        column = dimension
 
-        # `column` is selected exclusively from a hard-coded whitelist above;
-        # it is therefore safe to interpolate as an SQL identifier.
         with get_db_cursor() as cur:
             cur.execute(
                 f"""
@@ -178,6 +150,7 @@ class StatsService:
                 WHERE COALESCE(payment_created_at, failed_at) >= %s
                   AND {column} IS NOT NULL
                   AND {column} <> ''
+                  AND status IN ('captured', 'failed')
                 GROUP BY {column}
                 ORDER BY {column}
                 """,
@@ -185,52 +158,37 @@ class StatsService:
             )
             rows = cur.fetchall()
 
-        results: List[EntityStat] = []
+        result: List[EntityStat] = []
         for value, captured, failed in rows:
             captured_count = int(captured or 0)
             failed_count = int(failed or 0)
             attempts = captured_count + failed_count
-            success_rate = (
-                captured_count / attempts if attempts else 0.0
-            )
-            results.append(
+            result.append(
                 EntityStat(
                     entity=value,
                     attempts=attempts,
                     captured=captured_count,
                     failed=failed_count,
-                    success_rate=success_rate,
+                    success_rate=(captured_count / attempts) if attempts else 0.0,
                 )
             )
-
-        return results
+        return result
 
     def get_funnel(self, hours: int) -> FunnelStats:
-        """Return recovery-funnel and treatment-vs-holdout metrics.
-
-        Payment-level counts are computed from `payments` alone so multiple
-        recovery_attempts rows for one payment cannot inflate funnel counts.
-        Email delivery count is computed independently from recovery_attempts.
-
-        Rates are ratios in [0, 1], matching the frontend's formatPercent().
-        """
+        """Calculate payment-level funnel metrics without join multiplication."""
         start_time = self._get_start_time(hours)
-
         with get_db_cursor() as cur:
-            # Payment-level metrics: deliberately no JOIN to avoid multiplying
-            # one failed payment by multiple recovery attempts.
             cur.execute(
                 """
                 SELECT
-                    COUNT(*) FILTER (
-                        WHERE status = 'failed'
-                    ) AS failed,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed,
                     COUNT(*) FILTER (
                         WHERE status = 'failed'
                           AND recovery_group IN ('treatment', 'holdout')
                     ) AS eligible,
                     COUNT(*) FILTER (
                         WHERE status = 'failed'
+                          AND recovery_group IN ('treatment', 'holdout')
                           AND recovery_status = 'recovered'
                     ) AS recovered,
                     COUNT(*) FILTER (
@@ -260,13 +218,11 @@ class StatsService:
                 """,
                 (start_time,),
             )
-            payment_row = cur.fetchone()
+            row = cur.fetchone()
 
-            # Only successfully sent/recovered email attempts count as emails
-            # sent. A failed/unsent attempt must not inflate the funnel.
             cur.execute(
                 """
-                SELECT COUNT(DISTINCT id)
+                SELECT COUNT(*)
                 FROM recovery_attempts
                 WHERE channel = 'email'
                   AND sent_at IS NOT NULL
@@ -275,13 +231,14 @@ class StatsService:
                 """,
                 (start_time,),
             )
-            email_row = cur.fetchone()
+            emails_row = cur.fetchone()
 
-        if not payment_row:
+        emails_sent = int(emails_row[0] or 0) if emails_row else 0
+        if not row:
             return FunnelStats(
                 failed=0,
                 eligible=0,
-                emails_sent=int(email_row[0] or 0) if email_row else 0,
+                emails_sent=emails_sent,
                 recovered=0,
                 treatment_count=0,
                 treatment_rate=0.0,
@@ -299,31 +256,22 @@ class StatsService:
             treatment_recovered,
             holdout_count,
             holdout_recovered,
-        ) = payment_row
+        ) = row
 
         treatment_count = int(treatment_count or 0)
         holdout_count = int(holdout_count or 0)
-
-        treatment_rate = (
-            int(treatment_recovered or 0) / treatment_count
-            if treatment_count
-            else 0.0
-        )
-        holdout_rate = (
-            int(holdout_recovered or 0) / holdout_count
-            if holdout_count
-            else 0.0
-        )
+        treatment_recovered = int(treatment_recovered or 0)
+        holdout_recovered = int(holdout_recovered or 0)
 
         return FunnelStats(
             failed=int(failed or 0),
             eligible=int(eligible or 0),
-            emails_sent=int(email_row[0] or 0) if email_row else 0,
+            emails_sent=emails_sent,
             recovered=int(recovered or 0),
             treatment_count=treatment_count,
-            treatment_rate=treatment_rate,
+            treatment_rate=(treatment_recovered / treatment_count) if treatment_count else 0.0,
             holdout_count=holdout_count,
-            holdout_rate=holdout_rate,
+            holdout_rate=(holdout_recovered / holdout_count) if holdout_count else 0.0,
             self_recovered=int(self_recovered or 0),
         )
 
@@ -338,7 +286,6 @@ class StatsService:
                     last_success_rate,
                     last_baseline,
                     last_attempts,
-                    healthy_streak,
                     state_changed_at
                 FROM alert_state
                 ORDER BY scope, scope_value
@@ -350,13 +297,11 @@ class StatsService:
             AlertStat(
                 scope=row[0],
                 scope_value=row[1],
-                current_success_rate=(
-                    float(row[3]) if row[3] is not None else None
-                ),
+                current_success_rate=(float(row[3]) if row[3] is not None else None),
                 baseline=(float(row[4]) if row[4] is not None else None),
                 attempts=int(row[5] or 0),
                 state=row[2],
-                state_changed_at=row[7],
+                state_changed_at=row[6],
             )
             for row in rows
         ]

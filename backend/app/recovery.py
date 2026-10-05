@@ -1,5 +1,6 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from backend.app.config import settings
 
@@ -10,8 +11,16 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def cancel_payment_actions(cur, payment_id: str, reason: str) -> None:
-    """Cancel all outstanding recovery actions for a payment idempotently."""
+    """Cancel all pending/claimed recovery actions for a payment."""
     cur.execute(
         """
         UPDATE scheduled_actions
@@ -33,7 +42,7 @@ def cancel_order_actions(
     current_payment_id: str,
     reason: str,
 ) -> None:
-    """Cancel outstanding recovery actions for earlier failed attempts of an order."""
+    """Cancel actions belonging to earlier failed attempts of the same order."""
     cur.execute(
         """
         UPDATE scheduled_actions AS a
@@ -53,12 +62,13 @@ def cancel_order_actions(
     )
 
 
-def _latest_sent_attempt_for_order(
+def _latest_qualifying_attempt_for_order(
     cur,
     order_id: str,
     captured_payment_id: str,
+    captured_at: datetime,
 ):
-    """Find the latest qualifying recovery email for this order."""
+    captured_at = _as_utc(captured_at) or _utc_now()
     cur.execute(
         """
         SELECT
@@ -75,14 +85,16 @@ def _latest_sent_attempt_for_order(
           AND ra.channel = 'email'
           AND ra.status IN ('sent', 'recovered')
           AND ra.sent_at IS NOT NULL
-          AND ra.sent_at >= CURRENT_TIMESTAMP
-              - (%s * INTERVAL '1 hour')
-        ORDER BY ra.sent_at DESC
+          AND ra.sent_at <= %s
+          AND %s <= ra.sent_at + (%s * INTERVAL '1 hour')
+        ORDER BY ra.sent_at DESC, ra.id DESC
         LIMIT 1
         """,
         (
             order_id,
             captured_payment_id,
+            captured_at,
+            captured_at,
             settings.RECOVERY_ATTRIBUTION_WINDOW_HOURS,
         ),
     )
@@ -93,43 +105,29 @@ def attribute_recovery(
     cur,
     order_id: str,
     captured_payment_id: str,
+    captured_at: Optional[datetime] = None,
 ) -> None:
-    """
-    Attribute an order-level capture to the most recent qualifying
-    recovery action, then mark earlier failed attempts without a
-    recovery message as self-recovered.
-    """
-    latest_attempt = _latest_sent_attempt_for_order(
+    """Apply 48-hour recovery attribution and conservative self-recovery rules."""
+    captured_at = _as_utc(captured_at) or _utc_now()
+    latest_attempt = _latest_qualifying_attempt_for_order(
         cur,
         order_id,
         captured_payment_id,
+        captured_at,
     )
 
     if latest_attempt:
-        attempt_id, original_payment_id, _, _ = latest_attempt
-        recovered_at = _utc_now()
-
+        attempt_id, original_payment_id, recovery_group, sent_at = latest_attempt
         cur.execute(
             """
             UPDATE recovery_attempts
             SET status = 'recovered',
-                recovered_payment_id = COALESCE(
-                    recovered_payment_id,
-                    %s
-                ),
-                recovered_at = COALESCE(
-                    recovered_at,
-                    %s
-                )
+                recovered_payment_id = COALESCE(recovered_payment_id, %s),
+                recovered_at = COALESCE(recovered_at, %s)
             WHERE id = %s
             """,
-            (
-                captured_payment_id,
-                recovered_at,
-                attempt_id,
-            ),
+            (captured_payment_id, captured_at, attempt_id),
         )
-
         cur.execute(
             """
             UPDATE payments
@@ -140,17 +138,18 @@ def attribute_recovery(
             """,
             (original_payment_id,),
         )
-
         logger.info(
-            "Attributed captured payment %s to recovery attempt %s "
-            "for failed payment %s",
+            "Recovery attributed: captured=%s original=%s attempt=%s group=%s sent_at=%s",
             captured_payment_id,
-            attempt_id,
             original_payment_id,
+            attempt_id,
+            recovery_group,
+            sent_at,
         )
 
-    # A failed payment that recovered successfully without ever receiving
-    # a recovery email is classified as self-recovered.
+    # A failed payment is self-recovered only when no recovery email has EVER
+    # successfully been sent for that payment. A message sent outside the 48-hour
+    # attribution window therefore remains unattributed rather than being relabeled.
     cur.execute(
         """
         UPDATE payments AS p
@@ -177,57 +176,61 @@ def handle_paid_link_recovery(
     cur,
     link_id: str,
     payment_id: str,
+    event_at: Optional[datetime] = None,
 ) -> bool:
-    """
-    Attribute a paid Razorpay Payment Link to the recovery attempt
-    that originally created it.
-    """
+    """Attribute a paid RecoveryAI Payment Link to its original failed payment."""
+    event_at = _as_utc(event_at) or _utc_now()
     cur.execute(
         """
-        SELECT
-            id,
-            original_payment_id,
-            status
+        SELECT id,
+               original_payment_id,
+               status,
+               sent_at
         FROM recovery_attempts
         WHERE link_id = %s
+        ORDER BY id
+        LIMIT 1
         FOR UPDATE
         """,
         (link_id,),
     )
-
     row = cur.fetchone()
-
     if not row:
-        logger.warning(
-            "Paid link event received for unmatched link_id=%s",
-            link_id,
-        )
+        logger.warning("Unmatched recovery Payment Link paid event: %s", link_id)
         return False
 
-    attempt_id, original_payment_id, previous_status = row
-    recovered_at = _utc_now()
+    attempt_id, original_payment_id, status, sent_at = row
+
+    if sent_at is not None:
+        sent_at = _as_utc(sent_at)
+        within_window = sent_at <= event_at <= sent_at + timedelta(
+            hours=settings.RECOVERY_ATTRIBUTION_WINDOW_HOURS
+        )
+    else:
+        within_window = False
+
+    if not within_window:
+        logger.warning(
+            "Recovery Payment Link %s was paid outside attribution window or before send state "
+            "(attempt=%s status=%s sent_at=%s event_at=%s)",
+            link_id,
+            attempt_id,
+            status,
+            sent_at,
+            event_at,
+        )
+        return False
 
     cur.execute(
         """
         UPDATE recovery_attempts
         SET status = 'recovered',
-            recovered_payment_id = COALESCE(
-                recovered_payment_id,
-                %s
-            ),
-            recovered_at = COALESCE(
-                recovered_at,
-                %s
-            )
+            recovered_payment_id = COALESCE(recovered_payment_id, %s),
+            recovered_at = COALESCE(recovered_at, %s)
         WHERE id = %s
         """,
-        (
-            payment_id,
-            recovered_at,
-            attempt_id,
-        ),
+        (payment_id, event_at, attempt_id),
     )
-
     cur.execute(
         """
         UPDATE payments
@@ -238,20 +241,12 @@ def handle_paid_link_recovery(
         """,
         (original_payment_id,),
     )
-
-    cancel_payment_actions(
-        cur,
-        original_payment_id,
-        "payment_link_paid",
-    )
+    cancel_payment_actions(cur, original_payment_id, "payment_link_paid")
 
     logger.info(
-        "Recovery attempt %s marked recovered from "
-        "Payment Link %s / payment %s (previous_status=%s)",
+        "Recovery attempt %s attributed through Payment Link %s to payment %s",
         attempt_id,
         link_id,
         payment_id,
-        previous_status,
     )
-
     return True

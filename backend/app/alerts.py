@@ -9,10 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 def next_state(previous_state: str, healthy_streak: int, condition_true: bool):
-    """Apply the configured two-check alert-state hysteresis."""
+    """Apply configured two-consecutive-healthy-check hysteresis."""
     if previous_state == "ok":
         return ("alerting", 0) if condition_true else ("ok", 0)
-
     if previous_state == "alerting":
         if condition_true:
             return "alerting", 0
@@ -20,23 +19,21 @@ def next_state(previous_state: str, healthy_streak: int, condition_true: bool):
         if healthy_streak >= settings.ALERT_HEALTHY_CHECKS_TO_CLEAR:
             return "ok", 0
         return "alerting", healthy_streak
-
     return "ok", 0
 
 
 def run_evaluate_alerts() -> None:
-    """Evaluate the latest health snapshot and persist dashboard-only alert state."""
+    """Evaluate the latest minute and persist dashboard-only alert state."""
     with get_db_cursor() as cur:
         cur.execute("SELECT MAX(ts) FROM health_snapshots")
         row = cur.fetchone()
         if not row or not row[0]:
-            logger.warning("No health snapshots available for alert evaluation")
+            logger.info("No health snapshots available for alert evaluation")
             return
 
         latest_ts = row[0]
-        latest_local_hour = latest_ts.astimezone(
-            ZoneInfo(settings.QUIET_HOURS_TIMEZONE)
-        ).hour
+        tz = ZoneInfo(settings.QUIET_HOURS_TIMEZONE)
+        latest_local_hour = latest_ts.astimezone(tz).hour
         baseline_start = latest_ts - timedelta(days=settings.ALERT_BASELINE_DAYS)
 
         cur.execute(
@@ -44,6 +41,7 @@ def run_evaluate_alerts() -> None:
             SELECT scope, scope_value, success_rate, attempts
             FROM health_snapshots
             WHERE ts = %s
+            ORDER BY scope, scope_value
             """,
             (latest_ts,),
         )
@@ -61,41 +59,47 @@ def run_evaluate_alerts() -> None:
                   AND scope_value = %s
                   AND ts >= %s
                   AND ts < %s
-                  AND EXTRACT(HOUR FROM ts AT TIME ZONE 'Asia/Kolkata') = %s
+                  AND EXTRACT(HOUR FROM ts AT TIME ZONE %s) = %s
                 """,
-                (scope, scope_value, baseline_start, latest_ts, latest_local_hour),
+                (
+                    scope,
+                    scope_value,
+                    baseline_start,
+                    latest_ts,
+                    settings.QUIET_HOURS_TIMEZONE,
+                    latest_local_hour,
+                ),
             )
-            baseline_row = cur.fetchone()
-            baseline = baseline_row[0] if baseline_row else None
+            baseline = cur.fetchone()[0]
             baseline = float(baseline) if baseline is not None else None
 
-            floor_breached = current_rate < settings.ALERT_SUCCESS_FLOOR_PERCENT / 100.0
-            baseline_breached = (
-                baseline is not None
-                and current_rate < baseline - settings.ALERT_DROP_THRESHOLD_PERCENT / 100.0
-            )
-            condition_true = attempts >= settings.ALERT_MIN_ATTEMPTS and (
-                floor_breached or baseline_breached
-            )
+            condition_true = False
+            if attempts >= settings.ALERT_MIN_ATTEMPTS:
+                floor_breached = current_rate < settings.ALERT_SUCCESS_FLOOR_PERCENT / 100.0
+                baseline_breached = (
+                    baseline is not None
+                    and current_rate
+                    < baseline - settings.ALERT_DROP_THRESHOLD_PERCENT / 100.0
+                )
+                condition_true = floor_breached or baseline_breached
 
             cur.execute(
                 """
                 SELECT state, healthy_streak
                 FROM alert_state
-                WHERE scope = %s AND scope_value = %s
+                WHERE scope = %s
+                  AND scope_value = %s
                 FOR UPDATE
                 """,
                 (scope, scope_value),
             )
             state_row = cur.fetchone()
-            if state_row:
-                previous_state, healthy_streak = state_row
-            else:
-                previous_state, healthy_streak = "ok", 0
+            previous_state = state_row[0] if state_row else "ok"
+            healthy_streak = int(state_row[1] or 0) if state_row else 0
 
             new_state, new_streak = next_state(
                 previous_state,
-                int(healthy_streak or 0),
+                healthy_streak,
                 condition_true,
             )
 
@@ -106,8 +110,10 @@ def run_evaluate_alerts() -> None:
                     last_success_rate, last_baseline, last_attempts,
                     state_changed_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s,
-                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
                 ON CONFLICT (scope, scope_value) DO UPDATE SET
                     state = EXCLUDED.state,
                     healthy_streak = EXCLUDED.healthy_streak,
@@ -131,5 +137,17 @@ def run_evaluate_alerts() -> None:
                     attempts,
                 ),
             )
+
+            if new_state != previous_state:
+                logger.warning(
+                    "ALERT STATE CHANGE | %s:%s | %s -> %s | rate=%s baseline=%s attempts=%s",
+                    scope,
+                    scope_value,
+                    previous_state,
+                    new_state,
+                    current_rate,
+                    baseline,
+                    attempts,
+                )
 
     logger.info("Health alerts evaluated for snapshot %s", latest_ts.isoformat())

@@ -13,10 +13,17 @@ def _utc_now() -> datetime:
 
 def _success_rate(captured: int, failed: int) -> float:
     attempts = captured + failed
-    return (captured / attempts) if attempts else 0.0
+    return captured / attempts if attempts else 0.0
 
 
-def save_snapshot(cur, ts: datetime, scope: str, scope_value: str, captured: int, failed: int) -> None:
+def save_snapshot(
+    cur,
+    ts: datetime,
+    scope: str,
+    scope_value: str,
+    captured: int,
+    failed: int,
+) -> None:
     captured = int(captured or 0)
     failed = int(failed or 0)
     attempts = captured + failed
@@ -39,69 +46,47 @@ def save_snapshot(cur, ts: datetime, scope: str, scope_value: str, captured: int
 
 
 def run_snapshot_health() -> None:
-    """Generate one-minute global, bank, and method health snapshots."""
+    """Generate minute-granularity health snapshots from PostgreSQL state."""
     now = _utc_now()
     ts = now.replace(second=0, microsecond=0)
     window_start = ts - timedelta(minutes=settings.HEALTH_WINDOW_MINUTES)
 
+    query = """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'captured') AS captured,
+            COUNT(*) FILTER (
+                WHERE status = 'failed'
+                  AND COALESCE(failure_category, '') <> 'user_cancelled'
+            ) AS failed
+        FROM payments
+        WHERE COALESCE(payment_created_at, failed_at) >= %s
+          AND status IN ('captured', 'failed')
+    """
+
+    grouped = """
+        SELECT
+            {column},
+            COUNT(*) FILTER (WHERE status = 'captured') AS captured,
+            COUNT(*) FILTER (
+                WHERE status = 'failed'
+                  AND COALESCE(failure_category, '') <> 'user_cancelled'
+            ) AS failed
+        FROM payments
+        WHERE COALESCE(payment_created_at, failed_at) >= %s
+          AND status IN ('captured', 'failed')
+          AND {column} IS NOT NULL
+          AND {column} <> ''
+        GROUP BY {column}
+    """
+
     with get_db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'captured') AS captured,
-                COUNT(*) FILTER (
-                    WHERE status = 'failed'
-                      AND COALESCE(failure_category, '') <> 'user_cancelled'
-                ) AS failed
-            FROM payments
-            WHERE COALESCE(payment_created_at, failed_at) >= %s
-              AND status IN ('captured', 'failed')
-            """,
-            (window_start,),
-        )
+        cur.execute(query, (window_start,))
         captured, failed = cur.fetchone()
         save_snapshot(cur, ts, "global", "all", captured, failed)
 
-        cur.execute(
-            """
-            SELECT
-                bank,
-                COUNT(*) FILTER (WHERE status = 'captured') AS captured,
-                COUNT(*) FILTER (
-                    WHERE status = 'failed'
-                      AND COALESCE(failure_category, '') <> 'user_cancelled'
-                ) AS failed
-            FROM payments
-            WHERE COALESCE(payment_created_at, failed_at) >= %s
-              AND status IN ('captured', 'failed')
-              AND bank IS NOT NULL
-              AND bank <> ''
-            GROUP BY bank
-            """,
-            (window_start,),
-        )
-        for bank, captured, failed in cur.fetchall():
-            save_snapshot(cur, ts, "bank", bank, captured, failed)
-
-        cur.execute(
-            """
-            SELECT
-                method,
-                COUNT(*) FILTER (WHERE status = 'captured') AS captured,
-                COUNT(*) FILTER (
-                    WHERE status = 'failed'
-                      AND COALESCE(failure_category, '') <> 'user_cancelled'
-                ) AS failed
-            FROM payments
-            WHERE COALESCE(payment_created_at, failed_at) >= %s
-              AND status IN ('captured', 'failed')
-              AND method IS NOT NULL
-              AND method <> ''
-            GROUP BY method
-            """,
-            (window_start,),
-        )
-        for method, captured, failed in cur.fetchall():
-            save_snapshot(cur, ts, "method", method, captured, failed)
+        for scope, column in (("bank", "bank"), ("method", "method")):
+            cur.execute(grouped.format(column=column), (window_start,))
+            for value, group_captured, group_failed in cur.fetchall():
+                save_snapshot(cur, ts, scope, value, group_captured, group_failed)
 
     logger.info("Health snapshot generated at %s", ts.isoformat())

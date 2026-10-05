@@ -1,36 +1,49 @@
-from backend.app.config import settings
-from celery import Celery
-from celery.schedules import crontab
+from urllib.parse import parse_qs, urlparse
 
-# Broker is rediss:// (SSL)
-broker_url = settings.REDIS_URL
-result_backend = settings.REDIS_URL
+from celery import Celery
+
+from backend.app.config import settings
+
+
+def _validate_redis_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "rediss":
+        return
+
+    query = parse_qs(parsed.query)
+    ssl_cert_reqs = query.get("ssl_cert_reqs", [None])[0]
+    if ssl_cert_reqs is None:
+        raise ValueError(
+            "REDIS_URL uses rediss:// but does not declare ssl_cert_reqs. "
+            "Configure Redis TLS explicitly, preferably ssl_cert_reqs=required."
+        )
+
+
+_validate_redis_url(settings.REDIS_URL)
 
 app = Celery(
     "worker",
-    broker=broker_url,
-    backend=result_backend,
-    include=["backend.worker.tasks"]
+    broker=settings.REDIS_URL,
+    include=["backend.worker.tasks"],
 )
 
-# Reliability settings
 app.conf.update(
-    # Acknowledge tasks late (after execution)
-    task_acks_late=True,
-    # Requeue task if worker crashes
-    task_reject_on_worker_lost=True,
-    # Use SSL for Redis (as per provider_notes.md)
-    # When using rediss://, Celery and redis-py handle the SSL handshake.
-    # We only add these if explicit CA certs or specific requirements are needed.
-    # Removing the explicit broker_use_ssl dictionary that was forcing a mismatch
-    # if the URL scheme was dynamically changed or misinterpreted.
+    # PostgreSQL is the business-state source of truth. Celery result persistence
+    # is not used by the application and would only add Redis traffic/storage.
+    task_ignore_result=True,
+    broker_pool_limit=5,
+    broker_connection_retry_on_startup=True,
 
-    # Task execution limits from config.py
+    # Recovery actions are bounded but involve external I/O. Prefetching several
+    # messages per worker process can hide due work behind a slow task.
+    worker_prefetch_multiplier=1,
+
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
     task_time_limit=300,
     task_soft_time_limit=240,
 )
 
-# Fixed code schedule for placeholder tasks
 app.conf.beat_schedule = {
     "pick-due-actions-every-60s": {
         "task": "backend.worker.tasks.pick_due_actions",
@@ -46,9 +59,10 @@ app.conf.beat_schedule = {
     },
     "retry-stuck-classifications-every-10m": {
         "task": "backend.worker.tasks.retry_stuck_classifications",
-        "schedule": 600, # Every 10 minutes
+        "schedule": 600,
     },
 }
+
 
 if __name__ == "__main__":
     app.start()

@@ -37,31 +37,51 @@ def classify_payment(payment_id: str):
 
 @shared_task
 def retry_stuck_classifications():
-    """Rediscover pending/failed classifications from PostgreSQL."""
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        minutes=settings.STUCK_CLASSIFICATION_MINUTES
-    )
+    """Rediscover classification work from PostgreSQL after a task/worker failure."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=settings.STUCK_CLASSIFICATION_MINUTES)
+
     with get_db_cursor() as cur:
         cur.execute(
             """
             SELECT payment_id
             FROM payments
             WHERE status = 'failed'
-              AND classification_status IN ('pending', 'failed')
               AND classification_attempts < %s
+              AND (
+                    classification_status IN ('pending', 'failed')
+                    OR (
+                        classification_status = 'processing'
+                        AND (
+                            classification_lease_expires_at IS NULL
+                            OR classification_lease_expires_at <= %s
+                        )
+                    )
+                  )
               AND updated_at < %s
             ORDER BY updated_at ASC
             LIMIT 100
             """,
-            (settings.MAX_CLASSIFICATION_RETRIES, cutoff),
+            (
+                settings.MAX_CLASSIFICATION_RETRIES,
+                now,
+                cutoff,
+            ),
         )
         stuck = [row[0] for row in cur.fetchall()]
 
+    queued = 0
     for payment_id in stuck:
-        logger.info("Re-queuing stuck classification for %s", payment_id)
-        classify_payment.delay(payment_id)
+        try:
+            classify_payment.delay(payment_id)
+            queued += 1
+        except Exception:
+            # The next beat tick will rediscover the row because PostgreSQL remains
+            # the source of truth for classification state.
+            logger.exception("Failed to re-queue classification for %s", payment_id)
 
-    return f"Re-queued {len(stuck)} payments"
+    logger.info("Re-queued %s of %s eligible classifications", queued, len(stuck))
+    return f"Re-queued {queued} payments"
 
 
 @shared_task

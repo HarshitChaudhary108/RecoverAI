@@ -16,6 +16,7 @@ class RazorpayPayment:
     status: str
     email: Optional[str]
     contact: Optional[str]
+    customer_id: Optional[str]
 
 
 class TemporaryProviderError(Exception):
@@ -68,9 +69,37 @@ class RazorpayClient:
                 status=payment["status"],
                 email=payment.get("email"),
                 contact=payment.get("contact"),
+                customer_id=payment.get("customer_id"),
             )
         except Exception as exc:
             raise self._provider_error(exc, "fetch payment") from exc
+
+    def fetch_customer(self, customer_id: str) -> Dict[str, Any]:
+        """Fetch the merchant-owned Razorpay Customer resource."""
+        if not customer_id:
+            raise PermanentProviderError("Razorpay customer_id is missing")
+        try:
+            customer = self.client.customer.fetch(customer_id)
+            if not isinstance(customer, dict):
+                raise TemporaryProviderError("Razorpay customer fetch returned invalid data")
+            return customer
+        except (PermanentProviderError, TemporaryProviderError):
+            raise
+        except Exception as exc:
+            raise self._provider_error(exc, "fetch customer") from exc
+
+    def resolve_customer_email(self, payment: RazorpayPayment) -> Optional[str]:
+        """Resolve the customer email from Razorpay's Customer resource first.
+
+        The payment-level email is retained only as a fallback for payment flows
+        that do not provide a customer_id.
+        """
+        if payment.customer_id:
+            customer = self.fetch_customer(payment.customer_id)
+            email = customer.get("email") or customer.get("customer_email")
+            if email:
+                return str(email).strip()
+        return payment.email.strip() if payment.email else None
 
     def is_order_paid(self, order_id: str) -> bool:
         try:
@@ -121,7 +150,6 @@ class RazorpayClient:
         data = {
             "amount": int(amount),
             "currency": currency,
-            "accept_notes": False,
             "customer": {"email": customer_email},
             "description": description,
             "reference_id": reference_id,

@@ -291,11 +291,53 @@ def run_action(action_id: str, worker_id: str) -> str:
             _log_run(action_id, payment_id, action_type, attempt_num, "cancelled", "expired")
             return "cancelled_expired"
 
-        email = payment.get("email")
+        # Resolve the customer-facing recipient from Razorpay's Customer resource.
+        # The payment entity's email can be a payment-level value that is not the
+        # merchant's canonical customer contact. Fall back to the stored payment
+        # email only when Razorpay does not provide customer_id.
+        try:
+            resolved_email = razorpay_client.resolve_customer_email(rp_payment)
+        except TemporaryProviderError as exc:
+            _safe_reschedule(
+                action_id,
+                worker_id,
+                _utc_now() + timedelta(seconds=policy.retry_backoff(attempt_num)),
+                str(exc),
+            )
+            _log_run(
+                action_id, payment_id, action_type, attempt_num, "rescheduled",
+                f"temporary: {exc}",
+            )
+            return "rescheduled_temporary"
+        except PermanentProviderError as exc:
+            _safe_fail(action_id, worker_id, str(exc))
+            _log_run(
+                action_id, payment_id, action_type, attempt_num, "failed",
+                f"permanent: {exc}",
+            )
+            return "failed_permanent"
+
+        email = resolved_email or payment.get("email")
         if not email:
-            _safe_fail(action_id, worker_id, "no_email")
-            _log_run(action_id, payment_id, action_type, attempt_num, "failed", "no_email")
-            return "failed_no_email"
+            _safe_fail(action_id, worker_id, "no_customer_email")
+            _log_run(
+                action_id, payment_id, action_type, attempt_num, "failed", "no_customer_email"
+            )
+            return "failed_no_customer_email"
+
+        # Keep PostgreSQL aligned with the recipient actually selected for the
+        # customer-facing action. Do not overwrite a newer non-empty value with NULL.
+        if resolved_email and resolved_email != payment.get("email"):
+            with get_db_cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE payments
+                    SET customer_email = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE payment_id = %s
+                    """,
+                    (resolved_email, payment_id),
+                )
 
         if payment.get("recovery_group") != "treatment":
             # A recovery action should only exist for treatment traffic. A mismatched

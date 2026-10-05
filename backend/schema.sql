@@ -1,3 +1,8 @@
+-- RecoverAI canonical PostgreSQL schema.
+-- PostgreSQL is the source of truth; Redis is only Celery transport.
+-- This file is safe to run on a new database. For an existing database,
+-- prefer the latest production migration in backend/migrations/ first.
+
 CREATE TABLE IF NOT EXISTS webhook_events (
     event_id TEXT PRIMARY KEY,
     event_type TEXT NOT NULL,
@@ -23,13 +28,15 @@ CREATE TABLE IF NOT EXISTS payments (
     failed_at TIMESTAMPTZ,
     captured_at TIMESTAMPTZ,
     classification_status TEXT NOT NULL CHECK (
-        classification_status IN ('pending', 'classified', 'failed')
+        classification_status IN ('pending', 'processing', 'classified', 'failed')
     ),
     failure_category TEXT,
     classification_confidence DOUBLE PRECISION,
     classification_reason TEXT,
     classification_error TEXT,
     classification_attempts INTEGER NOT NULL DEFAULT 0,
+    classification_lease_id TEXT,
+    classification_lease_expires_at TIMESTAMPTZ,
     recovery_group TEXT CHECK (
         recovery_group IN ('treatment', 'holdout', 'not_eligible')
     ),
@@ -44,6 +51,14 @@ CREATE INDEX IF NOT EXISTS idx_payments_order_id
 
 CREATE INDEX IF NOT EXISTS idx_payments_classification_retry
     ON payments(classification_status, classification_attempts, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_payments_classification_lease
+    ON payments(
+        classification_status,
+        classification_lease_expires_at,
+        classification_attempts,
+        updated_at
+    );
 
 CREATE TABLE IF NOT EXISTS scheduled_actions (
     action_id TEXT PRIMARY KEY,

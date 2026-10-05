@@ -67,7 +67,7 @@ def _process_event(event_id: str, payload: dict, cur):
                 status, error_code, error_reason, error_source, error_step,
                 customer_email, customer_contact, classification_status, recovery_status,
                 failed_at, payment_created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), to_timestamp(%s))
             ON CONFLICT (payment_id) DO UPDATE SET
                 status = EXCLUDED.status,
                 error_code = EXCLUDED.error_code,

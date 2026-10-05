@@ -129,7 +129,7 @@ class ActionsRepository:
         with get_db_cursor() as cur:
             cur.execute(
                 """
-                SELECT a.*, p.payment_id, p.amount, p.currency, p.email, p.failure_category, p.failed_at
+                SELECT a.*, p.payment_id, p.amount, p.currency, p.customer_email as email, p.failure_category, p.failed_at
                 FROM scheduled_actions a
                 JOIN payments p ON a.payment_id = p.payment_id
                 WHERE a.action_id = %s

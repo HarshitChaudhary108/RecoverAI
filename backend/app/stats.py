@@ -1,212 +1,301 @@
-from fastapi import APIRouter, Query, HTTPException, Depends
-from typing import List, Optional
 from datetime import datetime, timedelta, timezone
+from fastapi import APIRouter, Query
+
 from backend.app.db import get_db_cursor
 from backend.app.schemas import (
-    SummaryStats, TimeSeriesPoint, FailureReasonStat,
-    EntityStat, FunnelStats, AlertStat
+    AlertStat,
+    EntityStat,
+    FailureReasonStat,
+    FunnelStats,
+    SummaryStats,
+    TimeSeriesPoint,
 )
-
-class StatsService:
-    """
-    Service layer for calculating payment health and recovery statistics.
-    Encapsulates all SQL logic and data transformation.
-    """
-
-    def _get_start_time(self, hours: int) -> datetime:
-        """Calculate absolute UTC start time for the given window with a small buffer for clock skew."""
-        return datetime.now(timezone.utc) - timedelta(hours=hours, seconds=1)
-
-    def get_summary(self, hours: int) -> SummaryStats:
-        start_time = self._get_start_time(hours)
-        query = """
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'captured') * 100.0 /
-                    NULLIF(COUNT(*) FILTER (WHERE status <> 'pending' AND COALESCE(failure_category, '') <> 'user_cancelled'), 0) as success_rate,
-                COUNT(*) FILTER (WHERE status = 'failed') as failed_count,
-                COUNT(*) FILTER (WHERE recovery_status = 'recovered') as recovered_count,
-                COALESCE(SUM(amount) FILTER (WHERE recovery_status = 'recovered'), 0) as revenue_recovered,
-                COALESCE(SUM(amount) FILTER (WHERE status = 'failed' AND recovery_status = 'open' AND COALESCE(failure_category, '') <> 'user_cancelled'), 0) as revenue_at_risk
-            FROM payments
-            WHERE (failed_at >= %s OR failed_at IS NULL);
-        """
-        with get_db_cursor() as cur:
-            cur.execute(query, (start_time,))
-            row = cur.fetchone()
-            if not row:
-                return SummaryStats(success_rate=0.0, failed_count=0, recovered_count=0, revenue_recovered=0, revenue_at_risk=0)
-
-            return SummaryStats(
-                success_rate=row[0] or 0.0,
-                failed_count=row[1] or 0,
-                recovered_count=row[2] or 0,
-                revenue_recovered=int(row[3] or 0),
-                revenue_at_risk=int(row[4] or 0)
-            )
-
-    def get_timeseries(self, hours: int) -> List[TimeSeriesPoint]:
-        start_time = self._get_start_time(hours)
-        query = """
-            SELECT ts, success_rate FROM health_snapshots
-            WHERE scope = 'global' AND scope_value = 'all' AND ts >= %s
-            ORDER BY ts ASC;
-        """
-        with get_db_cursor() as cur:
-            cur.execute(query, (start_time,))
-            return [TimeSeriesPoint(timestamp=row[0], success_rate=row[1]) for row in cur.fetchall()]
-
-    def get_failure_reasons(self, hours: int) -> List[FailureReasonStat]:
-        start_time = self._get_start_time(hours)
-        query = """
-            SELECT failure_category, COUNT(*) as count FROM payments
-            WHERE status = 'failed' AND failed_at >= %s
-            GROUP BY failure_category;
-        """
-        with get_db_cursor() as cur:
-            cur.execute(query, (start_time,))
-            return [FailureReasonStat(category=row[0] or 'unknown', count=row[1]) for row in cur.fetchall()]
-
-    def get_entity_stats(self, entity_column: str, hours: int) -> List[EntityStat]:
-        # Whitelist allowed columns to prevent SQL injection
-        allowed_columns = {'bank', 'method'}
-        if entity_column not in allowed_columns:
-            raise ValueError(f"Invalid entity column: {entity_column}")
-
-        start_time = self._get_start_time(hours)
-        # We use f-string only for the column name which is whitelisted
-        query = f"""
-            SELECT {entity_column} as entity,
-                COUNT(*) as attempts,
-                COUNT(*) FILTER (WHERE status = 'captured') as captured,
-                COUNT(*) FILTER (WHERE status = 'failed') as failed,
-                COUNT(*) FILTER (WHERE status = 'captured') * 100.0 /
-                    NULLIF(COUNT(*) FILTER (WHERE status != 'user_cancelled' AND status != 'pending'), 0) as success_rate
-            FROM payments
-            WHERE (failed_at >= %s OR failed_at IS NULL)
-            GROUP BY {entity_column};
-        """
-        with get_db_cursor() as cur:
-            cur.execute(query, (start_time,))
-            return [
-                EntityStat(
-                    entity=row[0] or 'unknown',
-                    attempts=row[1],
-                    captured=row[2],
-                    failed=row[3],
-                    success_rate=row[4] or 0.0
-                ) for row in cur.fetchall()
-            ]
-
-    def get_recovery_funnel(self, hours: int) -> FunnelStats:
-        start_time = self._get_start_time(hours)
-
-        # Consolidated query for all payment-based funnel metrics
-        # Note: using absolute timestamp check for failed_at
-        payment_query = """
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'failed') as total_failed,
-                COUNT(*) FILTER (WHERE status = 'failed' AND recovery_group IN ('treatment', 'holdout')) as eligible,
-                COUNT(*) FILTER (WHERE recovery_status = 'recovered') as recovered,
-                COUNT(*) FILTER (WHERE recovery_status = 'self_recovered') as self_recovered,
-                COUNT(*) FILTER (WHERE status = 'failed' AND recovery_group = 'treatment') as treatment_count,
-                COUNT(*) FILTER (WHERE status = 'failed' AND recovery_group = 'treatment' AND recovery_status = 'recovered') * 100.0 /
-                    NULLIF(COUNT(*) FILTER (WHERE status = 'failed' AND recovery_group = 'treatment'), 0) as treatment_rate,
-                COUNT(*) FILTER (WHERE status = 'failed' AND recovery_group = 'holdout') as holdout_count,
-                COUNT(*) FILTER (WHERE status = 'failed' AND recovery_group = 'holdout' AND recovery_status = 'recovered') * 100.0 /
-                    NULLIF(COUNT(*) FILTER (WHERE status = 'failed' AND recovery_group = 'holdout'), 0) as holdout_rate
-            FROM payments
-            WHERE (failed_at >= %s OR failed_at IS NULL);
-        """
-
-        # Separate query for email delivery (different table)
-        email_query = """
-            SELECT COUNT(DISTINCT original_payment_id)
-            FROM recovery_attempts
-            WHERE sent_at >= %s;
-        """
-
-        with get_db_cursor() as cur:
-            cur.execute(payment_query, (start_time,))
-            p_row = cur.fetchone()
-
-            cur.execute(email_query, (start_time,))
-            e_row = cur.fetchone()
-
-            emails_sent = e_row[0] if e_row else 0
-
-            if not p_row:
-                return FunnelStats(
-                    failed=0, eligible=0, emails_sent=emails_sent, recovered=0,
-                    treatment_count=0, treatment_rate=0.0,
-                    holdout_count=0, holdout_rate=0.0,
-                    self_recovered=0
-                )
-
-            return FunnelStats(
-                failed=p_row[0] or 0,
-                eligible=p_row[1] or 0,
-                emails_sent=emails_sent,
-                recovered=p_row[2] or 0,
-                treatment_count=p_row[4] or 0,
-                treatment_rate=p_row[5] or 0.0,
-                holdout_count=p_row[6] or 0,
-                holdout_rate=p_row[7] or 0.0,
-                self_recovered=p_row[3] or 0
-            )
-
-    def get_alerts(self) -> List[AlertStat]:
-        query = """
-            SELECT scope, scope_value, last_success_rate as current_success_rate, last_baseline as baseline,
-                   last_attempts as attempts, state, state_changed_at
-            FROM alert_state;
-        """
-        with get_db_cursor() as cur:
-            cur.execute(query)
-            return [AlertStat(
-                scope=row[0], scope_value=row[1], current_success_rate=row[2],
-                baseline=row[3], attempts=row[4], state=row[5], state_changed_at=row[6]
-            ) for row in cur.fetchall()]
-
-# Dependency for FastAPI
-def get_stats_service() -> StatsService:
-    return StatsService()
 
 router = APIRouter()
 
-def validate_hours(hours: int):
-    if not (1 <= hours <= 168):
-        raise HTTPException(status_code=422, detail="Hours must be between 1 and 168")
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class StatsService:
+    """Read-only PostgreSQL-backed dashboard statistics."""
+
+    def _get_start_time(self, hours: int) -> datetime:
+        if hours <= 0:
+            raise ValueError("hours must be positive")
+        return _utc_now() - timedelta(hours=hours)
+
+    def get_summary(self, hours: int) -> SummaryStats:
+        start_time = self._get_start_time(hours)
+        with get_db_cursor() as cur:
+            cur.execute(
+                """
+                WITH windowed AS (
+                    SELECT *
+                    FROM payments
+                    WHERE COALESCE(payment_created_at, failed_at) >= %s
+                )
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'captured') AS captured,
+                    COUNT(*) FILTER (
+                        WHERE status = 'failed'
+                          AND COALESCE(failure_category, '') <> 'user_cancelled'
+                    ) AS failed_effective,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed_count,
+                    COUNT(*) FILTER (WHERE recovery_status = 'recovered') AS recovered_count,
+                    COALESCE(SUM(amount) FILTER (WHERE recovery_status = 'recovered'), 0) AS revenue_recovered,
+                    COALESCE(
+                        SUM(amount) FILTER (
+                            WHERE status = 'failed'
+                              AND recovery_status = 'open'
+                              AND failed_at IS NOT NULL
+                              AND failed_at >= %s
+                        ),
+                        0
+                    ) AS revenue_at_risk
+                FROM windowed
+                """,
+                (start_time, _utc_now() - timedelta(days=7)),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return SummaryStats(
+                success_rate=0.0,
+                failed_count=0,
+                recovered_count=0,
+                revenue_recovered=0,
+                revenue_at_risk=0,
+            )
+
+        captured, failed_effective, failed_count, recovered_count, revenue_recovered, revenue_at_risk = row
+        denominator = int(captured or 0) + int(failed_effective or 0)
+        success_rate = (float(captured or 0) / denominator * 100.0) if denominator else 0.0
+
+        return SummaryStats(
+            success_rate=success_rate,
+            failed_count=int(failed_count or 0),
+            recovered_count=int(recovered_count or 0),
+            revenue_recovered=int(revenue_recovered or 0),
+            revenue_at_risk=int(revenue_at_risk or 0),
+        )
+
+    def get_timeseries(self, hours: int):
+        start_time = self._get_start_time(hours)
+        with get_db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT ts, success_rate, attempts, captured, failed
+                FROM health_snapshots
+                WHERE scope = 'global' AND scope_value = 'all'
+                  AND ts >= %s
+                ORDER BY ts ASC
+                """,
+                (start_time,),
+            )
+            rows = cur.fetchall()
+        return [
+            TimeSeriesPoint(
+                ts=row[0],
+                success_rate=float(row[1] or 0.0) * 100.0,
+                attempts=int(row[2] or 0),
+                captured=int(row[3] or 0),
+                failed=int(row[4] or 0),
+            )
+            for row in rows
+        ]
+
+    def get_failure_reasons(self, hours: int):
+        start_time = self._get_start_time(hours)
+        with get_db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(failure_category, 'unclassified') AS reason,
+                       COUNT(*) AS count
+                FROM payments
+                WHERE status = 'failed'
+                  AND COALESCE(payment_created_at, failed_at) >= %s
+                GROUP BY COALESCE(failure_category, 'unclassified')
+                ORDER BY count DESC
+                """,
+                (start_time,),
+            )
+            rows = cur.fetchall()
+        return [FailureReasonStat(reason=row[0], count=int(row[1])) for row in rows]
+
+    def get_entity_stats(self, hours: int, dimension: str):
+        if dimension not in {"bank", "method"}:
+            raise ValueError("dimension must be bank or method")
+        start_time = self._get_start_time(hours)
+        column = "bank" if dimension == "bank" else "method"
+        with get_db_cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {column},
+                       COUNT(*) FILTER (WHERE status = 'captured') AS captured,
+                       COUNT(*) FILTER (
+                           WHERE status = 'failed'
+                             AND COALESCE(failure_category, '') <> 'user_cancelled'
+                       ) AS failed
+                FROM payments
+                WHERE COALESCE(payment_created_at, failed_at) >= %s
+                  AND {column} IS NOT NULL
+                  AND {column} <> ''
+                GROUP BY {column}
+                ORDER BY {column}
+                """,
+                (start_time,),
+            )
+            rows = cur.fetchall()
+
+        results = []
+        for value, captured, failed in rows:
+            captured = int(captured or 0)
+            failed = int(failed or 0)
+            attempts = captured + failed
+            rate = (captured / attempts * 100.0) if attempts else 0.0
+            results.append(
+                EntityStat(
+                    entity=value,
+                    attempts=attempts,
+                    captured=captured,
+                    failed=failed,
+                    success_rate=rate,
+                )
+            )
+        return results
+
+    def get_funnel(self, hours: int) -> FunnelStats:
+        start_time = self._get_start_time(hours)
+        with get_db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                    COUNT(*) FILTER (
+                        WHERE status = 'failed'
+                          AND recovery_group = 'treatment'
+                    ) AS treatment,
+                    COUNT(*) FILTER (
+                        WHERE status = 'failed'
+                          AND recovery_group = 'holdout'
+                    ) AS holdout,
+                    COUNT(DISTINCT ra.id) FILTER (
+                        WHERE p.status = 'failed'
+                          AND ra.status IN ('sent', 'recovered')
+                    ) AS messages_sent,
+                    COUNT(DISTINCT ra.id) FILTER (
+                        WHERE p.status = 'failed'
+                          AND ra.status = 'recovered'
+                    ) AS recovered
+                FROM payments AS p
+                LEFT JOIN recovery_attempts AS ra
+                  ON ra.original_payment_id = p.payment_id
+                WHERE COALESCE(p.payment_created_at, p.failed_at) >= %s
+                """,
+                (start_time,),
+            )
+            failed, treatment, holdout, messages_sent, recovered = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT ra.id)
+                FROM payments AS p
+                JOIN recovery_attempts AS ra
+                  ON ra.original_payment_id = p.payment_id
+                WHERE COALESCE(p.payment_created_at, p.failed_at) >= %s
+                  AND p.recovery_group = 'treatment'
+                  AND ra.status = 'recovered'
+                """,
+                (start_time,),
+            )
+            treatment_recovered = int(cur.fetchone()[0] or 0)
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM payments
+                WHERE COALESCE(payment_created_at, failed_at) >= %s
+                  AND recovery_group = 'holdout'
+                  AND recovery_status IN ('recovered', 'self_recovered')
+                """,
+                (start_time,),
+            )
+            holdout_recovered = int(cur.fetchone()[0] or 0)
+
+        return FunnelStats(
+            failed=int(failed or 0),
+            treatment=int(treatment or 0),
+            holdout=int(holdout or 0),
+            messages_sent=int(messages_sent or 0),
+            recovered=int(recovered or 0),
+            treatment_recovered=treatment_recovered,
+            holdout_recovered=holdout_recovered,
+        )
+
+    def get_alerts(self):
+        with get_db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT scope, scope_value, state,
+                       last_success_rate, last_baseline,
+                       last_attempts, healthy_streak,
+                       state_changed_at, updated_at
+                FROM alert_state
+                ORDER BY scope, scope_value
+                """
+            )
+            rows = cur.fetchall()
+        return [
+            AlertStat(
+                scope=row[0],
+                scope_value=row[1],
+                state=row[2],
+                current_success_rate=float(row[3] or 0.0) * 100.0,
+                baseline=(float(row[4]) * 100.0 if row[4] is not None else None),
+                attempts=int(row[5] or 0),
+                healthy_streak=int(row[6] or 0),
+                state_changed_at=row[7],
+                updated_at=row[8],
+            )
+            for row in rows
+        ]
+
+
+service = StatsService()
+
 
 @router.get("/stats/summary", response_model=SummaryStats)
-async def get_summary(hours: int = Query(24), service: StatsService = Depends(get_stats_service)):
-    validate_hours(hours)
+def summary(hours: int = Query(24, ge=1, le=24 * 30)):
     return service.get_summary(hours)
 
-@router.get("/stats/timeseries", response_model=List[TimeSeriesPoint])
-async def get_timeseries(hours: int = Query(24), service: StatsService = Depends(get_stats_service)):
-    validate_hours(hours)
+
+@router.get("/stats/timeseries", response_model=list[TimeSeriesPoint])
+def timeseries(hours: int = Query(24, ge=1, le=24 * 30)):
     return service.get_timeseries(hours)
 
-@router.get("/stats/failure-reasons", response_model=List[FailureReasonStat])
-async def get_failure_reasons(hours: int = Query(24), service: StatsService = Depends(get_stats_service)):
-    validate_hours(hours)
+
+@router.get("/stats/failure-reasons", response_model=list[FailureReasonStat])
+def failure_reasons(hours: int = Query(24, ge=1, le=24 * 30)):
     return service.get_failure_reasons(hours)
 
-@router.get("/stats/by-bank", response_model=List[EntityStat])
-async def get_by_bank(hours: int = Query(1), service: StatsService = Depends(get_stats_service)):
-    validate_hours(hours)
-    return service.get_entity_stats("bank", hours)
 
-@router.get("/stats/by-method", response_model=List[EntityStat])
-async def get_by_method(hours: int = Query(1), service: StatsService = Depends(get_stats_service)):
-    validate_hours(hours)
-    return service.get_entity_stats("method", hours)
+@router.get("/stats/by-bank", response_model=list[EntityStat])
+def by_bank(hours: int = Query(1, ge=1, le=24 * 30)):
+    return service.get_entity_stats(hours, "bank")
+
+
+@router.get("/stats/by-method", response_model=list[EntityStat])
+def by_method(hours: int = Query(1, ge=1, le=24 * 30)):
+    return service.get_entity_stats(hours, "method")
+
 
 @router.get("/recovery/funnel", response_model=FunnelStats)
-async def get_funnel(hours: int = Query(24), service: StatsService = Depends(get_stats_service)):
-    validate_hours(hours)
-    return service.get_recovery_funnel(hours)
+def recovery_funnel(hours: int = Query(24, ge=1, le=24 * 30)):
+    return service.get_funnel(hours)
 
-@router.get("/alerts", response_model=List[AlertStat])
-async def get_alerts(service: StatsService = Depends(get_stats_service)):
+
+@router.get("/alerts", response_model=list[AlertStat])
+def alerts():
     return service.get_alerts()

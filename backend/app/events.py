@@ -67,21 +67,21 @@ def _process_event(event_id: str, payload: dict, cur):
                 status, error_code, error_reason, error_source, error_step,
                 customer_email, customer_contact, classification_status, recovery_status,
                 failed_at, payment_created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), to_timestamp(%s))
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, to_timestamp(%s), to_timestamp(%s))
             ON CONFLICT (payment_id) DO UPDATE SET
                 status = EXCLUDED.status,
                 error_code = EXCLUDED.error_code,
                 error_reason = EXCLUDED.error_reason,
                 error_source = EXCLUDED.error_source,
                 error_step = EXCLUDED.error_step,
-                failed_at = NOW(),
+                failed_at = EXCLUDED.failed_at,
                 updated_at = CURRENT_TIMESTAMP
             WHERE payments.status != 'captured'
             """,
             (payment_id, order_id, amount, currency, method, bank,
              'failed', error_code, error_reason, error_source, error_step,
              email, contact, 'pending', 'open',
-             entity.get("created_at"))
+             entity.get("created_at"), entity.get("created_at"))
         )
         success = True
 
@@ -89,11 +89,18 @@ def _process_event(event_id: str, payload: dict, cur):
         entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
         payment_id = entity.get("id")
         order_id = entity.get("order_id")
+        created_at = entity.get("created_at")
         if payment_id:
             cur.execute(
-                "UPDATE payments SET status = 'captured', captured_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE payment_id = %s AND status != 'captured'",
-                (payment_id,)
+                "UPDATE payments SET status = 'captured', captured_at = to_timestamp(%s), updated_at = CURRENT_TIMESTAMP WHERE payment_id = %s AND status != 'captured'",
+                (created_at, payment_id) if created_at else (None, payment_id)
             )
+            if not created_at:
+                # Fallback to system clock if created_at is missing for captured_at
+                cur.execute(
+                    "UPDATE payments SET captured_at = CURRENT_TIMESTAMP WHERE payment_id = %s AND captured_at IS NULL",
+                    (payment_id,)
+                )
 
             if order_id:
                 from backend.app import recovery

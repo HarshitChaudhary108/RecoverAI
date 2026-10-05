@@ -111,13 +111,26 @@ def run_action(action_id: str, worker_id: str) -> str:
                     original_payment_id=payment_id,
                     expiry_unix=expiry_unix
                 )
-                # Save initial recovery attempt
+
+                # Calculate delay used for this attempt
+                # We use the difference between failure and current time
+                delay_used = 0
+                if payment["failed_at"]:
+                    delay_used = int((now - payment["failed_at"]).total_seconds() // 60)
+
+                # Save initial recovery attempt with canonical schema columns
+                # We generate a UUID for the PK 'id'
+                import uuid
                 cur.execute(
                     """
-                    INSERT INTO recovery_attempts (action_id, payment_id, link_id, link_url, status, created_at)
-                    VALUES (%s, %s, %s, %s, 'link_created', %s)
+                    INSERT INTO recovery_attempts (
+                        id, action_id, original_payment_id, link_id, link_url,
+                        recovery_group, delay_used, status, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'link_created', %s)
                     """,
-                    (action_id, payment_id, link_id, link_url, now)
+                    (str(uuid.uuid4()), action_id, payment_id, link_id, link_url,
+                     payment.get("recovery_group"), delay_used, now)
                 )
 
         # 11. Send the email with Resend

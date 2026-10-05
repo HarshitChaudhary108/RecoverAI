@@ -9,6 +9,11 @@ class ClaimError(Exception):
 class ActionsRepository:
     LEASE_TIME = timedelta(minutes=5)
 
+    @staticmethod
+    def generate_action_id(payment_id: str, action_type: str, step: int) -> str:
+        """Generates a deterministic action identifier based on business identity."""
+        return f"act_{payment_id}_{action_type}_{step}"
+
     def claim_due_actions(self, worker_id: str, limit: int, cur=None) -> List[Dict[str, Any]]:
         """
         Claims due actions in a single atomic transaction.
@@ -129,7 +134,7 @@ class ActionsRepository:
         with get_db_cursor() as cur:
             cur.execute(
                 """
-                SELECT a.*, p.payment_id, p.amount, p.currency, p.customer_email as email, p.failure_category, p.failed_at
+                SELECT a.*, p.payment_id, p.amount, p.currency, p.customer_email, p.failure_category, p.failed_at, p.recovery_group
                 FROM scheduled_actions a
                 JOIN payments p ON a.payment_id = p.payment_id
                 WHERE a.action_id = %s
@@ -145,10 +150,14 @@ class ActionsRepository:
 
             # Split into action and payment dicts
             action_cols = {"action_id", "payment_id", "action_type", "step", "run_at", "status", "attempts", "locked_by", "lease_expires_at", "result", "last_error", "completed_at"}
-            payment_cols = {"payment_id", "amount", "currency", "email", "failure_category", "failed_at"}
+            payment_cols = {"payment_id", "amount", "currency", "customer_email", "failure_category", "failed_at", "recovery_group"}
 
             action = {k: v for k, v in data.items() if k in action_cols}
             payment = {k: v for k, v in data.items() if k in payment_cols}
+
+            # Ensure 'email' alias exists for backward compatibility with executor.py
+            if "customer_email" in payment:
+                payment["email"] = payment["customer_email"]
 
             return action, payment
 

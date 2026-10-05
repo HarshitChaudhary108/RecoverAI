@@ -10,9 +10,7 @@ from backend.app.classifier import classify_failure, ClassificationError
 from backend.app.policy import assign_group, get_policy, adjust_for_quiet_hours
 from backend.app.db import get_db_cursor
 from backend.app.config import settings
-
-def generate_action_id(payment_id, action_type, step):
-    return f"act_{payment_id}_{action_type}_{step}"
+from backend.app.actions_repo import ActionsRepository
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +28,7 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
         with get_db_cursor() as cur:
             # 1. Load the payment
             cur.execute(
-                "SELECT status, classification_status, error_code, error_reason, "
+                "SELECT status, classification_status, failure_category, error_code, error_reason, "
                 "error_source, error_step, failed_at "
                 "FROM payments WHERE payment_id = %s FOR UPDATE",
                 (payment_id,)
@@ -40,10 +38,20 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
                 logger.warning(f"Payment {payment_id} not found")
                 return "not_found", None
 
-            status, classification_status, error_code, error_reason, error_source, error_step, failed_at = row
+            status, classification_status, failure_category, error_code, error_reason, error_source, error_step, failed_at = row
+
+            if failed_at is None:
+                logger.error(f"Payment {payment_id} has NULL failed_at. Cannot schedule recovery actions.")
+                cur.execute(
+                    "UPDATE payments SET classification_status = 'failed', classification_error = 'NULL failed_at', updated_at = %s WHERE payment_id = %s",
+                    (datetime.utcnow(), payment_id)
+                )
+                cur.connection.commit()
+                return "failed_null_timestamp", None
 
             if classification_status == "classified":
-                return "classified", category # Idempotency
+                return "classified", failure_category # Idempotency
+
 
             if status == "captured":
                 return "skipped", None # Already captured, no actions needed
@@ -51,9 +59,9 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
             # 2. Classify failure
             try:
                 classification = classify_failure(error_code, error_reason, error_source, error_step)
-                category = classification.category
+                failure_category = classification.category
                 confidence = classification.confidence
-                reason = classification.reason
+                classification_reason = classification.reason
             except (ClassificationError, Exception) as e:
                 # Fix: Update failure state on the SAME cursor to avoid row-lock deadlock.
                 # This ensures the 'failed' status is persisted before the transaction
@@ -88,22 +96,25 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
                 "classification_attempts = classification_attempts + 1, "
                 "updated_at = %s "
                 "WHERE payment_id = %s",
-                (category, confidence, reason, datetime.utcnow(), payment_id)
+                (failure_category, confidence, classification_reason, datetime.utcnow(), payment_id)
             )
 
+
             # Assign recovery group
-            group = assign_group(payment_id, category)
+            group = assign_group(payment_id, failure_category)
             cur.execute(
                 "UPDATE payments SET recovery_group = %s WHERE payment_id = %s",
                 (group, payment_id)
             )
 
+
             # Schedule actions if in treatment group
             if group == "treatment":
-                policy_steps = get_policy(category)
+                policy_steps = get_policy(failure_category)
                 for step in policy_steps:
                     if step["action_type"] == "manual_review":
                         continue # handled below for 'other'
+
 
                     delay_mins = step.get("delay_minutes", 0)
                     run_at = failed_at + timedelta(minutes=delay_mins)
@@ -114,7 +125,7 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
                         "(action_id, payment_id, action_type, step, run_at, status) "
                         "VALUES (%s, %s, %s, %s, %s, 'pending') "
                         "ON CONFLICT (payment_id, action_type, step) DO NOTHING",
-                        (generate_action_id(payment_id, step["action_type"], step["step"]),
+                        (ActionsRepository.generate_action_id(payment_id, step["action_type"], step["step"]),
                          payment_id, step["action_type"], step["step"], run_at)
                     )
 
@@ -125,12 +136,13 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
                     "(action_id, payment_id, action_type, step, run_at, status) "
                     "VALUES (%s, %s, 'manual_review', 1, %s, 'manual_review') "
                     "ON CONFLICT (payment_id, action_type, step) DO NOTHING",
-                    (generate_action_id(payment_id, 'manual_review', 1), payment_id, datetime.utcnow())
+                    (ActionsRepository.generate_action_id(payment_id, 'manual_review', 1), payment_id, datetime.utcnow())
                 )
                 # Log raw error fields for manual review
                 logger.info(f"Manual review required for {payment_id}. Errors: {error_code}, {error_reason}, {error_source}, {error_step}")
 
-            return "classified", category
+            return "classified", failure_category
+
 
     except ClassificationError as e:
         error_msg = str(e)
@@ -146,9 +158,10 @@ def classify_and_schedule(payment_id: str) -> Tuple[str, Optional[str]]:
             "classification_run | payment_id=%s | status=%s | category=%s | "
             "confidence=%s | latency=%.2fms | error=%s",
             payment_id,
-            "classified" if category else "failed",
-            category,
+            "classified" if failure_category else "failed",
+            failure_category,
             confidence,
             latency,
             error_msg
         )
+

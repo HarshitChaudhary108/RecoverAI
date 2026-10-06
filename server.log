@@ -1,7 +1,0 @@
-INFO:     Started server process [29180]
-INFO:     Waiting for application startup.
-{"timestamp": "2026-10-03T03:42:24Z", "level": "INFO", "message": "Logging initialized in JSON mode", "module": "logging_setup", "funcName": "setup_logging", "lineno": 38}
-INFO:     Application startup complete.
-ERROR:    [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8000): [winerror 10048] only one usage of each socket address (protocol/network address/port) is normally permitted
-INFO:     Waiting for application shutdown.
-INFO:     Application shutdown complete.

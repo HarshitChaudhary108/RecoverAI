@@ -66,6 +66,7 @@ pnpm-debug.log*
 # Application logs & runtime files
 # =========================
 logs/
+docs/
 *.log
 *.pid
 *.pid.lock
